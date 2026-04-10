@@ -112,6 +112,11 @@ def upgrade() -> None:
     )
     op.create_index('idx_company_embeddings_company', 'company_embeddings', ['company_id'], unique=False)
     op.create_index('idx_company_embeddings_type', 'company_embeddings', ['embedding_type'], unique=False)
+    op.execute(
+        "CREATE INDEX idx_company_embeddings_vector "
+        "ON company_embeddings USING ivfflat (embedding vector_cosine_ops) "
+        "WITH (lists = 100)"
+    )
     op.create_table('company_founders',
     sa.Column('company_id', sa.UUID(), nullable=False),
     sa.Column('founder_id', sa.UUID(), nullable=False),
@@ -180,6 +185,7 @@ def downgrade() -> None:
     op.drop_index('idx_funding_rounds_company', table_name='funding_rounds')
     op.drop_table('funding_rounds')
     op.drop_table('company_founders')
+    op.execute("DROP INDEX IF EXISTS idx_company_embeddings_vector")
     op.drop_index('idx_company_embeddings_type', table_name='company_embeddings')
     op.drop_index('idx_company_embeddings_company', table_name='company_embeddings')
     op.drop_table('company_embeddings')
