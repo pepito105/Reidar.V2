@@ -10,6 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from pgvector.sqlalchemy import Vector
 
 # revision identifiers, used by Alembic.
 revision: str = 'd623b43ffd99'
@@ -102,7 +103,7 @@ def upgrade() -> None:
     sa.Column('firm_id', sa.UUID(), nullable=True),
     sa.Column('embedding_type', sa.Text(), nullable=False),
     sa.Column('content_hash', sa.Text(), nullable=False),
-    sa.Column('embedding', pgvector.sqlalchemy.vector.VECTOR(dim=1536), nullable=False),
+    sa.Column('embedding', Vector(1536), nullable=False),
     sa.Column('model_version', sa.Text(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
