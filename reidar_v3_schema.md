@@ -1238,13 +1238,7 @@ CREATE TABLE documents (
     source          TEXT NOT NULL,
     -- Values: email_attachment / shared_link / uploaded / slack_share
     source_interaction_id UUID REFERENCES interactions(id),
-    -- The interaction record that delivered this document (email case).
-
-    source_slack_message_id UUID REFERENCES slack_messages(id),
-    -- The slack_messages record that delivered this document (slack_share case).
-    -- Exactly one of source_interaction_id or source_slack_message_id should
-    -- be set depending on the value of source. Both may be NULL for
-    -- manually uploaded documents.
+    -- The interaction (email, Slack message) that delivered this document.
 
     -- Storage
     storage_url     TEXT,           -- internal storage reference if saved
@@ -1494,9 +1488,10 @@ CREATE TABLE events (
     -- pipeline_stage_changed / score_overridden / memo_rated /
     -- outreach_sent / note_added / company_added_manually
     --
-    -- Integration events (triggered by external services):
+    -- Integration events (triggered by external services via webhook):
     -- email_received / email_sent / calendar_event_created /
     -- transcript_uploaded / slack_message_sent / founder_replied
+    -- Note: integration events should always carry a webhook_id for dedup.
     --
     -- Agent events (triggered by other agents):
     -- research_agent_started / research_agent_completed /
@@ -1515,8 +1510,7 @@ CREATE TABLE events (
     entity_type     TEXT,
     -- What is this event about?
     -- Values: company / firm / firm_company / interaction / memo /
-    --         founder / signal / scrape_job / agent_run /
-    --         calendar_event / slack_message / document
+    --         founder / signal / scrape_job / agent_run
     
     entity_id       UUID,
     -- The UUID of the entity this event concerns.
@@ -1539,6 +1533,17 @@ CREATE TABLE events (
     -- { "batch": "S26", "company_count": 247,
     --   "companies_ingested": 247, "top_matches": ["...", "..."] }
     
+    -- Webhook deduplication
+    webhook_id      TEXT UNIQUE,
+    -- The unique identifier supplied by the external webhook delivery.
+    -- Set for integration events (email_received, calendar_event_created,
+    -- transcript_uploaded, slack_message_sent, founder_replied).
+    -- NULL for system and user events that are not webhook-sourced.
+    -- UNIQUE constraint prevents the same webhook delivery from creating
+    -- duplicate event records. External services (Gmail, Slack, Google
+    -- Calendar, Granola) sometimes deliver the same webhook more than once.
+    -- The webhook handler should INSERT with ON CONFLICT DO NOTHING.
+
     -- Processing state
     processed_at    TIMESTAMPTZ,
     -- NULL = not yet processed. Set when an agent has consumed this event.
@@ -1562,6 +1567,9 @@ CREATE INDEX idx_events_unprocessed ON events(created_at ASC)
     WHERE processed_at IS NULL;
 -- This index is critical — agents poll for unprocessed events efficiently.
 CREATE INDEX idx_events_entity ON events(entity_type, entity_id);
+CREATE UNIQUE INDEX idx_events_webhook_id ON events(webhook_id)
+    WHERE webhook_id IS NOT NULL;
+-- Partial unique index — only enforces uniqueness when webhook_id is set.
 ```
 
 **Why this exists:** The events table is what makes Reidar agentic rather
@@ -1774,6 +1782,7 @@ ORDER BY frs.signal_date DESC;
 4. **The events table is append-only.** Three fields may be updated
    after insert: processed_at (set when consumed), processing_attempts
    (incremented on each retry), and last_error (set on failure).
+   webhook_id is set at insert time and never updated.
    No other field may ever be updated. No row may ever be deleted.
 
 5. **Reasoning signals are extracted, not entered.** firm_reasoning_signals
