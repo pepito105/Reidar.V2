@@ -9,3 +9,19 @@ from app.models.global_kb import (  # noqa: F401
     Investor,
     RoundInvestor,
 )
+from app.models.per_firm import (  # noqa: F401
+    CalendarEvent,
+    Document,
+    Firm,
+    FirmCompany,
+    FirmEmbedding,
+    FirmMember,
+    FirmNotification,
+    FirmReasoningSignal,
+    InvestmentMemo,
+    Interaction,
+    OutreachEvent,
+    PipelineStageTransition,
+    ScoreDelta,
+    SlackMessage,
+)
