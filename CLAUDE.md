@@ -283,6 +283,7 @@ Layer 1: companies, founders, investors, funding_rounds,
 Layer 2: firms, firm_members, firm_companies,
          pipeline_stage_transitions, interactions,
          firm_reasoning_signals, score_deltas, outreach_events,
+         calendar_events, slack_messages, documents,
          firm_embeddings (Pool 2), investment_memos,
          firm_notifications
 

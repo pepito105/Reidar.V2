@@ -662,7 +662,8 @@ CREATE TABLE firm_companies (
     
     -- Second encounter support
     previously_seen     BOOLEAN DEFAULT FALSE,
-    previous_pass_id    UUID,   -- self-reference to earlier firm_company record
+    previous_pass_id    UUID REFERENCES firm_companies(id),
+    -- Self-reference to earlier firm_company record.
     -- If a company comes back around, we link to the prior evaluation.
     -- This is how Reidar surfaces "you saw this company before, here's
     -- how you thought about it then, here's what has changed."
@@ -772,7 +773,14 @@ CREATE TABLE interactions (
     -- meeting notes, etc. This is the source material for extraction.
     
     subject         TEXT,           -- email subject or meeting title
-    participants    TEXT[],         -- array of participant names/emails
+    participants    JSONB,
+    -- Structured array of participant objects, not raw strings.
+    -- TEXT[] loses name/role/affiliation — JSONB preserves it.
+    -- Example:
+    -- [{ "name": "Maria Chen", "email": "maria@benchmark.com",
+    --    "role": "Partner", "affiliation": "Benchmark", "type": "investor" },
+    --   { "name": "Alex Wu", "email": "alex@acme.com",
+    --    "role": "CEO", "affiliation": "Acme Corp", "type": "founder" }]
     direction       TEXT,           -- inbound / outbound / internal
     
     -- Parsed metadata
@@ -851,6 +859,20 @@ CREATE TABLE firm_reasoning_signals (
     -- red_flag              — something that triggered concern
     -- behavioral_signal     — inferred from behavior, not stated explicitly
     --                         e.g., "responded in 3 hours" = high conviction
+    -- second_encounter       — company previously evaluated, prior reasoning surfaced
+    --                         e.g., "passed 8 months ago citing market size;
+    --                         now at $800K ARR — original concern partially addressed"
+    -- intro_path             — who introduced whom, relationship graph signal
+    --                         e.g., "intro via portfolio founder at Acme —
+    --                         second deal sourced through this network node"
+    -- calendar_pattern       — meeting recurrence, escalation, cancellation signals
+    --                         e.g., "third founder meeting in 10 days — escalating
+    --                         conviction; GP added to most recent invite"
+    -- network_signal         — co-investor patterns, LP introductions, conference
+    --                         connections — who the firm interacts with around a deal
+    -- velocity_signal        — speed of pipeline movement and response latency
+    --                         e.g., "moved from first_call to diligence in 3 days —
+    --                         fastest stage transition for any deal this quarter"
     
     -- Entity scope
     entity_type     TEXT,
@@ -1029,6 +1051,250 @@ CREATE INDEX idx_outreach_firm ON outreach_events(firm_id);
 CREATE INDEX idx_outreach_firm_company ON outreach_events(firm_company_id);
 ```
 
+
+### `calendar_events`
+
+Raw calendar events received from the calendar integration. This is a
+staging table — events arrive here before Reidar has matched them to a
+company. A background agent processes each record, attempts company
+matching, and creates a linked `interactions` record when a match is
+found. Without this staging table, calendar events that arrive before
+Reidar knows which company is involved would be lost.
+
+Recurrence patterns (RRULE) are stored here because they are critical
+for detecting meeting escalation signals — a founder meeting that recurs
+weekly within 10 days signals a different conviction level than a
+one-time call.
+
+```sql
+CREATE TABLE calendar_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    firm_id         UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    member_id       UUID NOT NULL REFERENCES firm_members(id) ON DELETE CASCADE,
+
+    -- Raw calendar data
+    calendar_event_id   TEXT NOT NULL,  -- external calendar provider ID
+    title               TEXT,           -- event title (may contain founder/company name)
+    description         TEXT,           -- event body/notes
+    location            TEXT,
+
+    -- Timing
+    started_at          TIMESTAMPTZ NOT NULL,
+    ended_at            TIMESTAMPTZ,
+    duration_minutes    INTEGER,
+
+    -- Attendees (structured — same JSONB pattern as interactions.participants)
+    attendees           JSONB,
+    -- [{ "name": "...", "email": "...", "role": "...", "affiliation": "..." }]
+
+    -- Recurrence
+    is_recurring        BOOLEAN DEFAULT FALSE,
+    recurrence_rule     TEXT,           -- RRULE string, e.g. "FREQ=WEEKLY;COUNT=4"
+    recurrence_parent_id UUID REFERENCES calendar_events(id),
+    -- Links recurring instances back to the original event.
+    -- Recurrence patterns are reasoning signals:
+    -- weekly founder meetings = escalating conviction.
+
+    -- Company matching state
+    matching_status     TEXT DEFAULT 'pending',
+    -- Values: pending / matched / no_match / ambiguous
+    matched_company_id  UUID REFERENCES companies(id),
+    matched_firm_company_id UUID REFERENCES firm_companies(id),
+    match_confidence    TEXT,           -- high / medium / low
+
+    -- Downstream linkage
+    interaction_id      UUID REFERENCES interactions(id),
+    -- Set after a matched calendar event creates an interactions record.
+
+    -- Source
+    source              TEXT NOT NULL DEFAULT 'google_calendar',
+    raw_payload         JSONB,          -- full raw event from calendar API
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_calendar_events_firm ON calendar_events(firm_id);
+CREATE INDEX idx_calendar_events_member ON calendar_events(member_id);
+CREATE INDEX idx_calendar_events_started ON calendar_events(started_at DESC);
+CREATE INDEX idx_calendar_events_matching ON calendar_events(matching_status)
+    WHERE matching_status = 'pending';
+CREATE INDEX idx_calendar_events_company ON calendar_events(matched_company_id)
+    WHERE matched_company_id IS NOT NULL;
+```
+
+**Why this exists:** The `interactions` table requires a `firm_company_id`
+at creation time. Calendar events arrive before Reidar knows which company
+a meeting is about. This staging table receives all calendar events,
+runs company matching asynchronously, and creates the linked interaction
+record only when a match is confirmed. It also preserves recurrence data
+which is a distinct reasoning signal not available on the interaction record.
+
+---
+
+### `slack_messages`
+
+Slack messages from connected workspaces that are relevant to deal flow.
+This is the highest-fidelity unfiltered reasoning signal in the system —
+partners and analysts say what they actually think in Slack before they
+have had time to rationalize it. A post-call Slack message written in
+the 10 minutes after hanging up is more honest than anything that goes
+into a formal CRM note.
+
+This table only stores deal-relevant messages — not every message in
+every channel. The Slack integration uses keyword matching, channel
+scoping, and entity detection to identify deal-related messages before
+storing them here.
+
+```sql
+CREATE TABLE slack_messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    firm_id         UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    member_id       UUID REFERENCES firm_members(id),
+    -- Which firm member sent or received this message?
+
+    -- Slack metadata
+    slack_message_id    TEXT NOT NULL UNIQUE,   -- Slack message ts identifier
+    slack_channel_id    TEXT NOT NULL,
+    slack_channel_name  TEXT,
+    slack_thread_ts     TEXT,           -- NULL if not a thread reply
+    slack_user_id       TEXT,           -- Slack user ID of the sender
+
+    -- Content
+    raw_content         TEXT NOT NULL,  -- raw message text
+    message_type        TEXT NOT NULL,
+    -- Values: post_call_reaction / deal_commentary / partner_discussion /
+    --         intro_request / signal_share / pass_discussion /
+    --         conviction_signal / question / general
+
+    -- Company linkage (may be NULL if not yet matched)
+    firm_company_id     UUID REFERENCES firm_companies(id),
+    company_id          UUID REFERENCES companies(id),
+
+    -- Timing
+    sent_at             TIMESTAMPTZ NOT NULL,
+
+    -- Extraction state
+    extraction_status   TEXT DEFAULT 'pending',
+    -- Values: pending / processing / complete / failed
+    extracted_at        TIMESTAMPTZ,
+
+    -- Extracted signals (high-level, before full extraction pipeline)
+    detected_sentiment  TEXT,           -- positive / negative / neutral / mixed
+    detected_conviction TEXT,           -- increasing / decreasing / unchanged
+    mentions_company    BOOLEAN DEFAULT FALSE,
+    mentions_founder    BOOLEAN DEFAULT FALSE,
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_slack_messages_firm ON slack_messages(firm_id);
+CREATE INDEX idx_slack_messages_company ON slack_messages(firm_company_id)
+    WHERE firm_company_id IS NOT NULL;
+CREATE INDEX idx_slack_messages_sent ON slack_messages(sent_at DESC);
+CREATE INDEX idx_slack_messages_extraction ON slack_messages(extraction_status)
+    WHERE extraction_status = 'pending';
+CREATE INDEX idx_slack_messages_type ON slack_messages(firm_id, message_type);
+```
+
+**Why this exists:** The `interactions` table is designed for structured
+interactions between the firm and a founder. Slack messages are internal
+— between members of the same firm — and require different extraction
+logic. The reasoning signals embedded in internal deal commentary are
+among the most valuable in the system: they capture what partners actually
+think before they have formalized their position.
+
+---
+
+### `documents`
+
+Documents received or referenced during the deal flow — pitch decks,
+one-pagers, financial models, technical due diligence reports. A document
+is a distinct entity with its own lifecycle: received, opened, forwarded,
+re-requested. This lifecycle is itself a reasoning signal. The email that
+delivered a pitch deck is captured in `interactions`, but subsequent
+engagements with the same document cannot be linked without a document
+entity.
+
+```sql
+CREATE TABLE documents (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    firm_id         UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    firm_company_id UUID REFERENCES firm_companies(id),
+    -- NULL if document arrived before company was matched.
+
+    -- Document identity
+    document_type   TEXT NOT NULL,
+    -- Values: pitch_deck / one_pager / financial_model / cap_table /
+    --         technical_dd / reference_doc / term_sheet / loi /
+    --         portfolio_update / market_map / other
+
+    title           TEXT,
+    file_name       TEXT,
+    file_size_bytes INTEGER,
+    mime_type       TEXT,
+
+    -- Source
+    source          TEXT NOT NULL,
+    -- Values: email_attachment / shared_link / uploaded / slack_share
+    source_interaction_id UUID REFERENCES interactions(id),
+    -- The interaction record that delivered this document (email case).
+
+    source_slack_message_id UUID REFERENCES slack_messages(id),
+    -- The slack_messages record that delivered this document (slack_share case).
+    -- Exactly one of source_interaction_id or source_slack_message_id should
+    -- be set depending on the value of source. Both may be NULL for
+    -- manually uploaded documents.
+
+    -- Storage
+    storage_url     TEXT,           -- internal storage reference if saved
+    content_hash    TEXT,           -- for deduplication across re-sends
+
+    -- Engagement tracking
+    first_opened_at     TIMESTAMPTZ,
+    last_opened_at      TIMESTAMPTZ,
+    open_count          INTEGER DEFAULT 0,
+    forwarded_to        JSONB,
+    -- Array of people this document was forwarded to:
+    -- [{ "name": "...", "email": "...", "forwarded_at": "..." }]
+    -- Forwarding behavior is a conviction and network signal.
+
+    re_requested        BOOLEAN DEFAULT FALSE,
+    -- Did the firm ask the founder to resend or update this document?
+    -- Re-requesting a deck or model is a high-conviction signal.
+
+    -- Extraction state
+    extraction_status   TEXT DEFAULT 'pending',
+    -- Values: pending / processing / complete / failed / skipped
+    -- Claude Haiku can extract key data points from pitch decks.
+    extracted_at        TIMESTAMPTZ,
+    extracted_data      JSONB,
+    -- Structured extraction from the document content.
+    -- For pitch_deck: { "problem": "...", "solution": "...",
+    --   "market_size": "...", "traction": "...", "ask": "..." }
+
+    received_at         TIMESTAMPTZ NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_documents_firm ON documents(firm_id);
+CREATE INDEX idx_documents_firm_company ON documents(firm_company_id)
+    WHERE firm_company_id IS NOT NULL;
+CREATE INDEX idx_documents_type ON documents(firm_id, document_type);
+CREATE INDEX idx_documents_extraction ON documents(extraction_status)
+    WHERE extraction_status = 'pending';
+CREATE INDEX idx_documents_received ON documents(received_at DESC);
+```
+
+**Why this exists:** A pitch deck is not just an email attachment — it is
+a document with its own engagement lifecycle. How many times was it opened?
+Was it forwarded internally? Was a newer version requested? These engagement
+patterns are reasoning signals that cannot be captured on the email record
+alone. The `documents` table gives documents first-class entity status so
+their full lifecycle can be tracked and extracted.
+
+---
+
 ---
 
 ### `firm_embeddings` (Pool 2)
@@ -1176,7 +1442,7 @@ CREATE TABLE firm_notifications (
     body            TEXT,
     
     related_company_id UUID REFERENCES companies(id),
-    related_event_id   UUID,   -- links to events table
+    related_event_id   UUID REFERENCES events(id)   -- links to events table
     
     -- Delivery
     delivered_in_app    BOOLEAN DEFAULT FALSE,
@@ -1249,7 +1515,8 @@ CREATE TABLE events (
     entity_type     TEXT,
     -- What is this event about?
     -- Values: company / firm / firm_company / interaction / memo /
-    --         founder / signal / scrape_job / agent_run
+    --         founder / signal / scrape_job / agent_run /
+    --         calendar_event / slack_message / document
     
     entity_id       UUID,
     -- The UUID of the entity this event concerns.
@@ -1275,7 +1542,9 @@ CREATE TABLE events (
     -- Processing state
     processed_at    TIMESTAMPTZ,
     -- NULL = not yet processed. Set when an agent has consumed this event.
-    -- This is the ONLY field that can be updated after insert.
+    -- Three fields may be updated after insert (and only these three):
+    -- processed_at, processing_attempts, last_error.
+    -- All other fields are immutable. The event record itself is never modified.
     
     processing_attempts INTEGER DEFAULT 0,
     -- How many times has an agent tried to process this event?
@@ -1502,9 +1771,10 @@ ORDER BY frs.signal_date DESC;
    Pool 2 embeddings: firm_id IS NOT NULL. Enforced by CHECK constraint.
    Never cross-contaminate the pools.
 
-4. **The events table is append-only.** You may set processed_at.
-   You may increment processing_attempts. You may never UPDATE any other
-   field. You may never DELETE a row.
+4. **The events table is append-only.** Three fields may be updated
+   after insert: processed_at (set when consumed), processing_attempts
+   (incremented on each retry), and last_error (set on failure).
+   No other field may ever be updated. No row may ever be deleted.
 
 5. **Reasoning signals are extracted, not entered.** firm_reasoning_signals
    is written by the extraction pipeline (Claude Haiku), not by humans
