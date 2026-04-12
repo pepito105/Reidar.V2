@@ -9,6 +9,11 @@ from app.models.global_kb import (  # noqa: F401
     Investor,
     RoundInvestor,
 )
+from app.models.events import (  # noqa: F401
+    AgentRun,
+    Event,
+    ScrapeJob,
+)
 from app.models.per_firm import (  # noqa: F401
     CalendarEvent,
     Document,
