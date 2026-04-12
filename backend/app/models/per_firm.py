@@ -72,6 +72,8 @@ class Firm(Base):
 
     # Status
     is_active = Column(Boolean, nullable=True, server_default="true")
+    decision_structure = Column(Text, nullable=False, server_default="partnership")
+    # Values: solo_gp / partnership / team_with_lead / institutional
     onboarded_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(
@@ -114,6 +116,11 @@ class FirmMember(Base):
     calendar_connected = Column(Boolean, nullable=True, server_default="false")
     calendar_access_token = Column(Text, nullable=True)   # encrypted
     calendar_refresh_token = Column(Text, nullable=True)  # encrypted
+
+    # Personal investment lens — per-member, extracted from interactions
+    personal_thesis = Column(Text, nullable=True)
+    focus_sectors = Column(ARRAY(Text), nullable=False, server_default="{}")
+    conviction_patterns = Column(JSONB, nullable=False, server_default="{}")
 
     is_active = Column(Boolean, nullable=True, server_default="true")
     joined_at = Column(
@@ -359,6 +366,13 @@ class FirmReasoningSignal(Base):
         ForeignKey("firms.id", ondelete="CASCADE"),
         nullable=False,
     )
+    member_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("firm_members.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    # NULL = firm-level signal visible to everyone
+    # SET = personal signal visible only to this member
 
     # Source linkage
     interaction_id = Column(
@@ -410,6 +424,11 @@ class FirmReasoningSignal(Base):
         Index("idx_reasoning_signals_type", "firm_id", "signal_type"),
         Index("idx_reasoning_signals_entity", "entity_id"),
         Index("idx_reasoning_signals_company", "firm_company_id"),
+        Index(
+            "idx_reasoning_signals_member",
+            "member_id",
+            postgresql_where=text("member_id IS NOT NULL"),
+        ),
     )
 
 
