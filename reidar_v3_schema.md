@@ -528,6 +528,20 @@ CREATE TABLE firms (
     slack_bot_token     TEXT,
     slack_channel_id    TEXT,   -- primary channel for Reidar alerts
     
+    -- Decision structure
+    decision_structure  TEXT NOT NULL DEFAULT 'partnership',
+    -- How this firm makes investment decisions. Shapes Reidar's output format,
+    -- notification routing, and how heavily partner-level thesis is weighted.
+    -- Values:
+    -- solo_gp      — one person sees and decides everything. Firm layer and
+    --                personal layer are the same. Speed is everything.
+    -- partnership  — 2-3 people, shared visibility, informal process.
+    --                Both firm context and individual lenses matter equally.
+    -- team_with_lead — associates screen, partners decide, some IC formality.
+    --                  Routing intelligence matters — surface the right partner.
+    -- institutional — formal IC process, multiple stakeholders, structured pipeline.
+    --                 IC preparation and routing are primary outputs.
+
     -- Status
     is_active           BOOLEAN DEFAULT TRUE,
     onboarded_at        TIMESTAMPTZ,
@@ -578,6 +592,37 @@ CREATE TABLE firm_members (
     calendar_access_token  TEXT,           -- encrypted
     calendar_refresh_token TEXT,           -- encrypted
     
+    -- Personal investment lens (the individual layer — not shared firm mandate)
+    -- This is what makes each person's Reidar different from their colleagues'.
+    personal_thesis     TEXT,
+    -- This person's own investment lens in their words.
+    -- For a conviction-driven investor with no formal thesis, this is populated
+    -- by Reidar from their decision history: "You consistently back technical
+    -- first-time founders with domain expertise in markets where the status quo
+    -- is a spreadsheet." May be NULL at onboarding and filled in over time.
+
+    focus_sectors       TEXT[] NOT NULL DEFAULT '{}',
+    -- The specific sectors where this person has deep pattern recognition.
+    -- Different from the firm's focus_sectors — a partner at a generalist fund
+    -- may have a personal thesis in healthcare AI even if the firm has no mandate.
+
+    conviction_patterns JSONB NOT NULL DEFAULT '{}',
+    -- Structured patterns extracted from this person's decision history.
+    -- Written by the extraction pipeline, not by the person themselves.
+    -- Example:
+    -- {
+    --   "founder_patterns": ["technical_domain_expert", "prior_exit", "first_time_founder"],
+    --   "sector_convictions": ["healthcare_ai", "legal_tech", "dev_tools"],
+    --   "pass_patterns": ["no_technical_cofounder", "consumer_play", "enterprise_sales_heavy"],
+    --   "stage_sweet_spot": "pre_seed",
+    --   "check_size_comfort": "250k_to_1m",
+    --   "confidence": "medium",
+    --   "decisions_analyzed": 23,
+    --   "last_updated": "2026-04-12"
+    -- }
+    -- Confidence increases as more decisions are analyzed.
+    -- This is what enables "this matches YOUR pattern" vs firm-level scoring.
+
     is_active   BOOLEAN DEFAULT TRUE,
     joined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -836,7 +881,23 @@ pipeline after processing raw interactions.
 CREATE TABLE firm_reasoning_signals (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     firm_id         UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
-    
+
+    -- Signal scope: firm-level vs personal
+    member_id       UUID REFERENCES firm_members(id) ON DELETE CASCADE,
+    -- NULL  = firm-level signal, visible to everyone at the firm.
+    --         Examples: pass reasons, partner objections in IC, portfolio conflicts.
+    -- SET   = personal signal, visible only to this member.
+    --         Examples: this analyst's conviction pattern, their personal pass reasons,
+    --         behavioral signals inferred from their individual workflow.
+    --
+    -- Pool 2 retrieval always fetches BOTH:
+    --   WHERE firm_id = :firm_id
+    --   AND (member_id IS NULL OR member_id = :member_id)
+    --
+    -- This is what gives every person their own Reidar while keeping firm context shared.
+    -- A new associate sees the firm's full decision history immediately (member_id IS NULL).
+    -- Their personal lens builds privately over time (member_id = their id).
+
     -- Source linkage
     interaction_id      UUID REFERENCES interactions(id) ON DELETE SET NULL,
     firm_company_id     UUID REFERENCES firm_companies(id) ON DELETE CASCADE,
@@ -1709,13 +1770,33 @@ LIMIT 10;
 ### 3. Pool 2 retrieval — find firm-specific reasoning signals
 
 ```sql
+-- Standard retrieval: firm-level signals + this member's personal signals
 SELECT fe.content_text, fe.signal_type, fe.source_type,
        1 - (fe.embedding <=> :query_embedding) AS similarity
 FROM firm_embeddings fe
+JOIN firm_reasoning_signals frs ON frs.id::text = fe.source_id::text
 WHERE fe.firm_id = :firm_id          -- Pool 2: firm_id MUST be set
+  AND (frs.member_id IS NULL         -- firm-level: visible to everyone
+    OR frs.member_id = :member_id)   -- personal: visible only to this member
 ORDER BY fe.embedding <=> :query_embedding
 LIMIT 15;
+
+-- Personal-only retrieval: used when building conviction_patterns for a member
+SELECT fe.content_text, fe.signal_type,
+       1 - (fe.embedding <=> :query_embedding) AS similarity
+FROM firm_embeddings fe
+JOIN firm_reasoning_signals frs ON frs.id::text = fe.source_id::text
+WHERE fe.firm_id = :firm_id
+  AND frs.member_id = :member_id     -- personal signals only
+ORDER BY fe.embedding <=> :query_embedding
+LIMIT 20;
 ```
+
+**The two-layer retrieval:** Every person gets firm context (member_id IS NULL)
+plus their own private lens (member_id = their id). A new hire immediately
+sees the firm's full reasoning history. Their personal lens builds privately
+over time as they make decisions. Neither layer is visible to the other
+unless explicitly shared.
 
 ### 4. Combined RAG retrieval (what runs before every generation)
 

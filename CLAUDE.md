@@ -280,7 +280,7 @@ term_sheet → closed → passed / invested / portfolio
 Layer 1: companies, founders, investors, funding_rounds,
          global_signals, company_embeddings (Pool 1)
 
-Layer 2: firms, firm_members, firm_companies,
+Layer 2: firms (+ decision_structure), firm_members (+ personal_thesis, focus_sectors, conviction_patterns), firm_companies,
          pipeline_stage_transitions, interactions,
          firm_reasoning_signals, score_deltas, outreach_events,
          calendar_events, slack_messages, documents,
